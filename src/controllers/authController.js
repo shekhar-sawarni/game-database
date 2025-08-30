@@ -191,11 +191,16 @@ export async function requestPasswordReset(req, res) {
     const normalizedEmail = String(email).trim().toLowerCase();
     if (!validator.isEmail(normalizedEmail)) return res.status(400).json({ error: 'Invalid email' });
     const user = await UserModel.findOne({ email: normalizedEmail }).lean();
+    let devToken;
     if (user) {
       const token = uuidv4();
       await redisClient.set(`pwreset:${token}`, String(user.userId), 'EX', env.PASSWORD_RESET_TTL);
+      devToken = token;
     }
     // Always respond OK to avoid user enumeration
+    if (process.env.NODE_ENV !== 'production') {
+      return res.json({ ok: true, token: devToken || null });
+    }
     return res.json({ ok: true });
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -224,33 +229,5 @@ export async function resetPassword(req, res) {
 }
 
 // Email verification
-export async function requestEmailVerification(req, res) {
-  try {
-    const { email } = req.body || {};
-    if (!email) return res.status(400).json({ error: 'Email is required' });
-    const normalizedEmail = String(email).trim().toLowerCase();
-    const user = await UserModel.findOne({ email: normalizedEmail }).lean();
-    if (!user) return res.status(200).json({ ok: true });
-    const token = uuidv4();
-    await redisClient.set(`emailverify:${token}`, String(user.userId), 'EX', env.EMAIL_VERIFY_TTL);
-    // Normally send email with link containing token
-    return res.json({ ok: true, token });
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
-}
-
-export async function confirmEmailVerification(req, res) {
-  try {
-    const { token } = req.body || {};
-    if (!token) return res.status(400).json({ error: 'token is required' });
-    const userId = await redisClient.get(`emailverify:${token}`);
-    if (!userId) return res.status(400).json({ error: 'Invalid or expired token' });
-    await UserModel.updateOne({ userId }, { $set: { emailVerified: true } });
-    await redisClient.del(`emailverify:${token}`);
-    return res.json({ ok: true });
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
-}
+// Email verification removed
 

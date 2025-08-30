@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { getLeaderboard, getRank, getRating, postGameResult } from '../controllers/leaderboardController.js';
-import { signup, login, logout, refresh, updateProfile, changePassword, revokeAllSessions, requestPasswordReset, resetPassword, requestEmailVerification, confirmEmailVerification } from '../controllers/authController.js';
+import { signup, login, logout, refresh, updateProfile, changePassword, revokeAllSessions, requestPasswordReset, resetPassword } from '../controllers/authController.js';
 import { authRateLimiter, loginLimiter, requireAuth, ingestLimiter, requireIngestKey } from '../middleware/auth.js';
 import { UserModel } from '../models/user.js';
 import { LeaderboardManager } from '../services/leaderboardManager.js';
@@ -27,8 +27,7 @@ router.post('/auth/logout', logout);
 router.post('/auth/refresh', refresh);
 router.post('/auth/forgot-password', authRateLimiter, requestPasswordReset);
 router.post('/auth/reset-password', authRateLimiter, resetPassword);
-router.post('/auth/email/request-verify', authRateLimiter, requestEmailVerification);
-router.post('/auth/email/confirm-verify', authRateLimiter, confirmEmailVerification);
+// Email verification endpoints removed
 
 
 

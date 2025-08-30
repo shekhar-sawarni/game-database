@@ -5,8 +5,6 @@ import { env } from '../config/env.js';
 import { issueTokenPair, verifyRefreshToken, revokeRefreshToken, revokeAllUserRefreshTokens } from '../services/tokenService.js';
 import validator from 'validator';
 import { redisClient } from '../config/redis.js';
-import speakeasy from 'speakeasy';
-import QRCode from 'qrcode';
 import { counters } from '../services/metrics.js';
 import { logger } from '../services/logger.js';
 
@@ -65,7 +63,7 @@ export async function signup(req, res) {
 
 export async function login(req, res) {
   try {
-    const { email, password, twoFactorCode } = req.body || {};
+    const { email, password } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'Email and password are required' });
     const normalizedEmail = String(email).trim().toLowerCase();
     if (!validator.isEmail(normalizedEmail)) return res.status(400).json({ error: 'Invalid email' });
@@ -250,47 +248,6 @@ export async function confirmEmailVerification(req, res) {
     if (!userId) return res.status(400).json({ error: 'Invalid or expired token' });
     await UserModel.updateOne({ userId }, { $set: { emailVerified: true } });
     await redisClient.del(`emailverify:${token}`);
-    return res.json({ ok: true });
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
-}
-
-// 2FA setup
-export async function setupTwoFactor(req, res) {
-  try {
-    const user = await UserModel.findOne({ userId: req.user.userId });
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    const secret = speakeasy.generateSecret({ name: `Leaderboard (${user.email})` });
-    const otpauth = secret.otpauth_url;
-    const dataUrl = await QRCode.toDataURL(otpauth);
-    // store temp secret in redis for verification step
-    await redisClient.set(`2fa:setup:${user.userId}`, secret.base32, 'EX', 600);
-    return res.json({ qr: dataUrl, secret: secret.base32 });
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
-}
-
-export async function enableTwoFactor(req, res) {
-  try {
-    const { code } = req.body || {};
-    if (!code) return res.status(400).json({ error: 'code is required' });
-    const secret = await redisClient.get(`2fa:setup:${req.user.userId}`);
-    if (!secret) return res.status(400).json({ error: '2FA setup expired' });
-    const verified = speakeasy.totp.verify({ secret, encoding: 'base32', token: String(code), window: 1 });
-    if (!verified) return res.status(401).json({ error: 'Invalid 2FA code' });
-    await UserModel.updateOne({ userId: req.user.userId }, { $set: { 'twoFactor.enabled': true, 'twoFactor.secret': secret } });
-    await redisClient.del(`2fa:setup:${req.user.userId}`);
-    return res.json({ ok: true });
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
-}
-
-export async function disableTwoFactor(req, res) {
-  try {
-    await UserModel.updateOne({ userId: req.user.userId }, { $set: { 'twoFactor.enabled': false }, $unset: { 'twoFactor.secret': '' } });
     return res.json({ ok: true });
   } catch (err) {
     return res.status(500).json({ error: err.message });

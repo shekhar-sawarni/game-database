@@ -1,0 +1,15 @@
+{
+  "watch": ["src"],
+  "ext": "js,json",
+  "ignore": [
+    ".env",
+    "node_modules",
+    "README.md",
+    "Dockerfile",
+    "docker-compose.yml",
+    "package-lock.json",
+    "zlacking.txt"
+  ]
+}
+
+

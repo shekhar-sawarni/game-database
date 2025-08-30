@@ -1,0 +1,494 @@
+Real-Time Leaderboard Backend System
+To handle millions of users with frequent score updates (as in Chess.com or Codeforces), we use Redis as a
+high-performance in-memory store. Each game mode (e.g. “blitz”, “rapid”) has its own data sets. We store
+each user’s current rating in a Redis HASH ( HSET rating:{mode} ) and maintain leaderboards as Redis
+Sorted Sets (ZSET). Sorted sets automatically keep members (user IDs) ordered by score (rating), allowing
+efficient rank operations 1 2 . For example, adding or updating a user’s score uses ZADD / ZINCRBY
+(O(log N)), fetching a score is O(1), and getting a user’s rank is ZREVRANK (O(log N))       3   . This yields real-
+time ranking for millions of players with low latency.
+
+
+Key data structures and naming conventions include:
+
+
+     • User Ratings (Hash): rating:{mode} mapping user_id → rating .
+     • Global Leaderboard (ZSET): lb:{mode}:global (sharded as needed, see below).
+     • Top‑K Cache (ZSET): lb:{mode}:topK , a small sorted set (e.g. top 1000) for fast reads.
+     • Country Leaderboards (ZSET): lb:{mode}:country:{cc} , separate per country code.
+     • Friend Circles (ZSET): lb:{mode}:friends:{groupId} (computed via intersection, see below).
+     • Time-Bucketed (ZSET): lb:{mode}:day:{YYYYMMDD} , week:{YYYYWW} , etc., with TTL for daily/
+       seasonal boards.
+
+Using separate ZSETs per scope (global, regional, friends, daily) lets us serve each view efficiently 4 5 .
+For example, global and country leaderboards are simply distinct sorted sets. Friend leaderboards can be
+computed by intersecting a “friends list” set with the global board: e.g. keep a sorted set of friend IDs (all
+scores = 0) and run ZINTERSTORE lb:mode:friends:grp1 GLOBAL_LEADERBOARD FRIENDS_LIST to
+yield a friend-only leaderboard 6 . Time-bucketed leaderboards are created with date keys (e.g.
+ lb:blitz:day:20250827 ) and given a TTL so they auto-expire after the season 5 .
+
+
+By using Redis sorted sets, we achieve low-latency updates and queries. For example, retrieving the top 10
+players is a single ZREVRANGE call      3   , and getting a user’s score is ZSCORE (O(1)). The design is
+horizontally scalable: for very large leaderboards we can shard by score or user ID. Each shard is itself a
+ZSET (e.g. lb:blitz:global:0 , :1 , …). When updating, we compute which shard to use (e.g.
+shard = hash(user_id) % num_shards ). To get a user’s exact global rank across shards, we perform a
+scatter-gather: compute the rank or count in each shard and sum them             7    . (Redis’s ZCOUNT on each
+shard can quickly count how many players have a score above a given user     7       .)
+
+
+The system is event-driven. After each game or contest, a GameResult event is published (e.g. via Kafka). An
+Event Consumer service listens to this topic, computes new ratings via a Rating Engine, and then updates
+Redis. By coalescing updates in batches and using Redis pipelines or Lua scripts, we ensure each rating
+update is atomic 8 . Periodically, a Snapshot Generator service snapshots the top-K leaderboard (copying
+to a key like lb:{mode}:snap:{timestamp} ) so that read-heavy requests (e.g. “get top 100”) hit a static,
+cache-friendly copy.
+
+
+Below we outline the main modules and components, with example Python code for each.
+
+
+
+
+                                                         1
+Data Model and Redis Structures
+We use Redis HASH and ZSET data types. A Redis sorted set stores unique member IDs with an associated
+floating-point score 1 . For leaderboards:
+
+
+     • Ratings Hash: For each mode, HSET rating:{mode} user_id → rating . This stores each
+       user’s current rating. For example, HSET rating:blitz 1001 1520 .
+     • Leaderboards (ZSETs): Each leaderboard is a ZSET whose members are user IDs, scored by rating.
+       For example, ZADD lb:blitz:global 1520 1001 adds user 1001 with score 1520 to the global
+       blitz board. Redis keeps the set sorted by score, so the top players are at one end. As the official
+       Redis docs note, sorted sets are ideal for leaderboards in large games 1 .
+
+Typical keys (per mode ) are:
+
+
+
+  rating:{mode}                 #   HASH of user→rating
+  lb:{mode}:global              #   (optionally sharded) ZSET for global leaderboard
+  lb:{mode}:topK                #   ZSET caching the top-K players
+  lb:{mode}:country:US          #   ZSET for US players (example)
+  lb:{mode}:friends:grp1        #   ZSET for a friend-group leaderboard
+  lb:{mode}:day:20250827        #   ZSET for daily leaderboard (with TTL)
+
+
+
+The below table (from a design reference) shows that Redis sorted-set operations are logarithmic in the
+number of members (n), making them efficient even at large scale 3 :
+
+
+                  Command           Operation                               Time Complexity
+
+                   ZADD             Add/update a member with a score        O(log n)
+
+                   ZINCRBY          Increment member’s score                O(log n)
+
+                   ZREVRANK         Get member’s rank (high→low)            O(log n)
+
+                   ZSCORE           Get member’s score                      O(1)
+
+                   ZREVRANGE        Range query (e.g. top k)                O(log n + m)
+
+
+Building leaderboards in Redis frees the relational database from heavy sorting and ranking queries 9 .
+The metadata (usernames, etc.) can be stored separately (e.g. in SQL or Redis HASH) and joined as needed
+for display.
+
+
+Rating Engine
+This module computes new ratings after each match or contest. In games like chess or programming
+contests, ratings often follow Elo or Glicko formulas (not shown here in detail). We abstract it as a function
+that takes old ratings and results and returns new ratings. For illustration, below is a simple two-player Elo
+update:
+
+
+
+
+                                                       2
+  # rating_engine.py
+
+  def calculate_elo_rating(old_rating, opponent_rating, outcome, k=32):
+      """
+       Calculate a new Elo rating.
+       outcome = 1 for win, 0.5 for draw, 0 for loss.
+       """
+       expected = 1 / (1 + 10 ** ((opponent_rating - old_rating) / 400))
+       return old_rating + k * (outcome - expected)
+
+  def compute_new_ratings(game_result):
+      """
+      Example: update ratings for a 2-player game result.
+      game_result = {
+          'mode': 'blitz',
+          'players': [
+              {'user_id': '1001', 'score': 1},
+              {'user_id': '1002', 'score': 0}
+          ]
+      }
+      Returns a dict: {user_id: new_rating, ...}.
+      """
+      mode = game_result['mode']
+      players = game_result['players']
+      if len(players) != 2:
+          # Extend this logic for contests with >2 players.
+          return {}
+      p1, p2 = players
+      # Determine match outcome for player1
+      if p1['score'] > p2['score']:
+          out1, out2 = 1.0, 0.0
+      else:
+          out1, out2 = 0.0, 1.0
+      # (In practice, retrieve current ratings from database/Redis. Here we use
+  defaults.)
+      old1 = p1.get('old_rating', 1500)
+       old2 = p2.get('old_rating', 1500)
+       # Compute new ratings
+       new1 = calculate_elo_rating(old1, old2, out1)
+       new2 = calculate_elo_rating(old2, old1, out2)
+       return {p1['user_id']: new1, p2['user_id']: new2}
+
+
+This engine would normally fetch each user’s current rating (e.g. from Redis or SQL), apply the formula, and
+output the updated ratings. Those new ratings are then fed into the leaderboard update pipeline below.
+
+
+
+
+                                                     3
+Event Consumer & Update Pipeline
+We use an event-driven architecture (e.g. Kafka topics). After a game, a GameResult event is published.
+An Event Consumer service listens to these events and processes them. It calls the Rating Engine to
+compute new ratings, then updates Redis. To handle high throughput, the consumer can batch updates and
+use Redis pipelines or Lua scripts for atomicity   8   . Here’s a simplified example using a Python queue to
+simulate Kafka:
+
+
+
+  # event_consumer.py
+
+  from queue import Queue
+  from leaderboard_manager import LeaderboardManager
+  from rating_engine import compute_new_ratings
+
+  # Simulated event queue (replace with real Kafka consumer in production)
+  event_queue = Queue()
+
+  def rating_update_worker():
+      # For each game mode we could have separate managers/threads
+      lb_manager = LeaderboardManager(mode='blitz')
+      while True:
+          game_result = event_queue.get()   # blocks until an event arrives
+            if game_result is None:
+                break # stop signal
+            # Compute new ratings for players in the event
+            updated_ratings = compute_new_ratings(game_result)
+            # Update each user's rating and leaderboard
+            for user_id, new_rating in updated_ratings.items():
+                lb_manager.update_user_rating(user_id, new_rating)
+
+  # Example: start the worker (in real code, use threading or async)
+  # threading.Thread(target=rating_update_worker, daemon=True).start()
+
+  # Simulate publishing a game result event
+  game_event = {
+      'mode': 'blitz',
+      'players': [{'user_id': '1001', 'score': 1},
+                  {'user_id': '1002', 'score': 0}]
+  }
+  event_queue.put(game_event)
+
+
+When update_user_rating is called, it atomically updates all relevant Redis data (ratings hash, global
+ZSET, etc.). Using a pipeline ensures the hash and sorted sets update in one transaction, avoiding transient
+inconsistencies.
+
+
+
+
+                                                        4
+Leaderboard Manager
+This module encapsulates all Redis interactions for leaderboards. We maintain:
+
+
+     • Global (sharded) ZSETs: e.g. lb:{mode}:global:0 , :1 , … if we split into shards.
+     • Top-K cache: lb:{mode}:topK (kept trimmed to K entries).
+     • Time-bucketed: daily ZSETs like lb:{mode}:day:YYYYMMDD with a 1-day TTL.
+     • (Optionally, country and friends): e.g. lb:{mode}:country:US , lb:{mode}:friends:grp1 .
+
+Below is a Python class showing how to update these sets and compute ranks:
+
+
+
+  # leaderboard_manager.py
+
+  import redis
+  from datetime import datetime
+
+
+  redis_client = redis.Redis(host='localhost', port=6379, db=0)
+
+  NUM_SHARDS = 10      # for example
+
+  class LeaderboardManager:
+      def __init__(self, mode):
+          self.mode = mode
+          # Sharded global leaderboard keys
+          self.global_shards = [f"lb:{mode}:global:{i}" for i in
+  range(NUM_SHARDS)]
+          self.topk_key = f"lb:{mode}:topK"
+          self.daily_key_prefix = f"lb:{mode}:day:"
+
+       def get_shard(self, user_id):
+           # Simple hash by numeric ID (modify as needed)
+           return int(user_id) % NUM_SHARDS
+
+      def update_user_rating(self, user_id, new_rating, country_code=None,
+  friend_group=None):
+          """
+          Atomically update the rating hash and all relevant leaderboards.
+          """
+          pipe = redis_client.pipeline()
+          # 1) Update rating HASH
+          pipe.hset(f"rating:{self.mode}", user_id, new_rating)
+          # 2) Update global (sharded) sorted set
+          shard = self.get_shard(user_id)
+          pipe.zadd(self.global_shards[shard], {user_id: new_rating})
+          # 3) Update top-K cache
+          pipe.zadd(self.topk_key, {user_id: new_rating})
+
+
+
+
+                                                    5
+              # Trim the topK set to keep only highest K (e.g. 1000) entries
+              pipe.zremrangebyrank(self.topk_key, 0, -(1000+1)) # remove beyond
+  top1000
+              # 4) Update daily leaderboard
+              today = datetime.utcnow().strftime("%Y%m%d")
+              daily_key = self.daily_key_prefix + today
+              pipe.zadd(daily_key, {user_id: new_rating})
+              # Set TTL = 1 day (86400s) on the key if newly created
+              pipe.expire(daily_key, 86400)
+          # 5) (Optional) Update regional (country) leaderboard
+          if country_code:
+               pipe.zadd(f"lb:{self.mode}:country:{country_code}", {user_id:
+  new_rating})
+          # 6) (Optional) Update friends leaderboard if static (see note below)
+          #      Often, friend leaderboards are computed on demand via ZINTERSTORE.
+          # Execute all updates atomically
+          pipe.execute()
+
+        def get_user_rank(self, user_id):
+            """
+            Compute the exact global rank of a user across all shards.
+            Uses ZCOUNT to sum how many players have a higher score.
+            """
+            # Fetch the user's current rating
+            rating = redis_client.hget(f"rating:{self.mode}", user_id)
+            if rating is None:
+                return None # user not found
+            user_score = float(rating)
+            # Count how many players have a score > user_score in each shard
+            pipe = redis_client.pipeline()
+            for shard_key in self.global_shards:
+                # Use "(" to make the range (user_score, +inf)
+                pipe.zcount(shard_key, f"({user_score}", "+inf")
+            higher_counts = pipe.execute()
+            # Rank = number of players with higher score + 1
+            rank = sum(higher_counts) + 1
+            return rank
+
+
+        def get_top_k(self, k=100):
+            """Return top-k (user_id, score) from the topK cache."""
+            results = redis_client.zrevrange(self.topk_key, 0, k-1, withscores=True)
+            return [(uid.decode(), score) for uid, score in results]
+
+
+Notes: Friend Leaderboards are often computed via sorted-set intersection. For example, keep a ZSET of
+friend IDs ( lb:mode:friends:grp1 with dummy scores) and do ZINTERSTORE with the global board to
+filter just friends   6   . This avoids duplicating data; it can be done on demand or updated incrementally.
+
+
+
+
+                                                          6
+Snapshot Generator
+To serve read-heavy queries (like “get the top 100” from a web API) with minimal latency, we periodically
+snapshot the current top-K leaderboard into an immutable key. For example, every minute we can copy
+ lb:mode:topK into lb:mode:snap:{timestamp} . Clients then read from the latest snapshot. Here’s a
+sketch:
+
+
+
+  # snapshot_generator.py
+
+  from leaderboard_manager import LeaderboardManager, redis_client
+  from datetime import datetime
+
+  def snapshot_top_k(mode, K=100):
+      lb_mgr = LeaderboardManager(mode)
+      top_key = lb_mgr.topk_key
+      # Fetch current top K players
+      top_players = redis_client.zrevrange(top_key, 0, K-1, withscores=True)
+      if not top_players:
+          return
+      # Create a snapshot key with timestamp
+      timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+      snap_key = f"lb:{mode}:snap:{timestamp}"
+          # Store snapshot as a new sorted set
+          mapping = {uid.decode(): score for uid, score in top_players}
+          redis_client.zadd(snap_key, mapping)
+          # (Optional) set a TTL or mark as read-only for caching
+
+
+By caching snapshots (and potentially storing them in CDN or a web cache), we can serve the absolute
+leaderboard quickly. The snapshot can be rotated or kept for historical viewing (e.g. “leaderboard at contest
+end”). Historical leaderboards can be stored long-term (or in Redis Streams) with range queries for
+pagination 5 .
+
+
+Rank Query Service
+Clients often need to know a user’s current rank. We provide a rank service that returns a user’s rank (and
+optionally surrounding ranks). If a user is not in the top-K cache, we compute it on demand by the method
+above ( get_user_rank sums ZCOUNT of shards). This is an exact rank query. For very large user bases,
+an approximate rank (e.g. using precomputed histograms or percentiles) could be used to avoid querying
+all shards every time; however the exact method is usually fast enough if sharded in parallel 7 .
+
+
+Approximate rank: We could maintain a histogram of rating buckets to estimate rank quickly, at the cost of
+precision. But for exactness, summing ZCOUNT across shards is simple and runs in parallel under the hood,
+yielding one round-trip per shard.
+
+
+Example query code: (This is effectively the same as get_user_rank above, but wrapped for an API.)
+
+
+
+
+                                                     7
+  def get_exact_rank(mode, user_id):
+      lb_mgr = LeaderboardManager(mode)
+      return lb_mgr.get_user_rank(user_id)
+
+
+This returns None if the user has no rating yet.
+
+
+API Endpoints
+We expose REST endpoints for leaderboard data:
+
+
+     • GET /leaderboard/{mode} : Returns the top-K leaderboard for the given mode, using the latest
+      snapshot or cache.
+     • GET /rank/{mode}/{userId} : Returns the user’s current global rank (and score) for that mode.
+     • GET /rating/{mode}/{userId} : Returns the user’s current rating in that mode.
+
+Below is a simple Flask implementation:
+
+
+
+  # api_server.py
+
+  from flask import Flask, jsonify
+  from leaderboard_manager import LeaderboardManager, redis_client
+
+
+  app = Flask(__name__)
+
+  @app.route('/leaderboard/<mode>')
+  def get_leaderboard(mode):
+      """Return top 100 from the leaderboard snapshot or cache."""
+      lb_mgr = LeaderboardManager(mode)
+      # Try snapshot first (omitted: find latest snap key). Here we use topK
+  directly.
+      top_entries = redis_client.zrevrange(lb_mgr.topk_key, 0, 99,
+  withscores=True)
+      result = [{'user_id': uid.decode(), 'score': int(score)}
+                for uid, score in top_entries]
+      return jsonify(result)
+
+  @app.route('/rank/<mode>/<user_id>')
+  def get_rank(mode, user_id):
+      """Return the exact rank and score for a user."""
+      lb_mgr = LeaderboardManager(mode)
+      rank = lb_mgr.get_user_rank(user_id)
+      if rank is None:
+          return jsonify({'error': 'User not found'}), 404
+      score = int(redis_client.hget(f"rating:{mode}", user_id) or 0)
+      return jsonify({'user_id': user_id, 'rank': rank, 'score': score})
+
+
+
+
+                                                   8
+  @app.route('/rating/<mode>/<user_id>')
+  def get_rating(mode, user_id):
+      """Return the current rating for a user."""
+      rating = redis_client.hget(f"rating:{mode}", user_id)
+       if rating is None:
+           return jsonify({'error': 'User not found'}), 404
+       return jsonify({'user_id': user_id, 'rating': int(rating)})
+
+
+  if __name__ == '__main__':
+      app.run(host='0.0.0.0', port=8000)
+
+
+This API returns JSON. In production, we would add caching headers, authentication, etc.
+
+
+Non-Functional Considerations
+     • Atomicity & Concurrency: We use Redis pipelines or Lua scripts for atomic multi-key updates. Redis
+       is single-threaded per shard, so each transaction executes without interference. This makes
+       concurrent score updates safe 8 .
+     • Scalability: Sharding the ZSETs (by score or user ID) allows us to scale horizontally. Redis Cluster can
+       also be used. We choose a shard key (here we used user_id mod N ) that suits the query patterns.
+       Pre-aggregating or replicating “hot” shards (top scores) can prevent hotspots   10   .
+     • Low Latency: Most operations (rank queries, top-K reads) are O(log n) or better, and Redis runs in
+       memory, so typical query latency is sub-millisecond. By serving from cached snapshots and using
+       pipelining, we aim for <100 ms end-to-end. Sorted sets give logarithmic time for rank and range
+       queries 2 3 .
+     • Idempotence: Event handlers should tolerate duplicates (e.g. by using unique event keys or
+       checking if an update was already applied). For example, include a unique contest ID and only apply
+       if not seen.
+     • Durability: Redis can periodically snapshot to disk or use AOF for persistence. We may also persist
+       rating changes to a long-term store (PostgreSQL/MySQL) asynchronously (write-behind cache) to
+       handle complex analytics and recoveries 9 .
+     • TTL and Data Lifecycle: Daily/weekly leaderboards use short-lived keys (with EXPIRE ) to
+       automatically roll over. Historical leaderboards (e.g. season snapshots) can be archived (e.g. in S3 or
+       Redis Streams) if needed 5 .
+
+
+Summary
+This design uses Redis sorted sets to efficiently maintain global and scoped leaderboards in real-time. An
+event-driven pipeline (Kafka or similar) ensures that each match result is processed and ratings are
+updated atomically. Leaderboards are sharded for scale and augmented with caches (top-K, snapshots) to
+serve fast queries. Regional and friend leaderboards use similar ZSET patterns (or set-intersections) for
+flexibility. All critical operations (updating scores, querying rank) remain logarithmic in user count 1 3 ,
+making this system capable of handling millions of users with low latency. The use of standard Redis
+primitives (HASH, ZSET, pipelines, Lua) ensures consistency and performance, while the modular Python
+code (shown above) can be extended for production readiness.
+
+
+
+
+                                                      9
+Sources: Best practices for leaderboard design with Redis           2   9   3   5   and official Redis documentation
+on sorted sets 1 were used to inform this design.
+
+
+
+ 1   Redis sorted sets | Docs
+https://redis.io/docs/latest/develop/data-types/sorted-sets/
+
+ 2    3   4   5   6   7    8   9   10   Leaderboard System Design - System Design
+https://systemdesign.one/leaderboard-system-design/
+
+
+
+
+                                                               10
+

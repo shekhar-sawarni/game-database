@@ -1,0 +1,29 @@
+Security hardening
+Enforce email verification, optional 2FA, password rotation, JWT key rotation
+Secret management (not .env in repo), per-environment configs, audit logs
+Input validation centralized (schema-based) and consistent error codes
+Reliability/scalability
+DLQ and retries with backoff for stream worker; visibility/consumer lag alarms
+Idempotency on more event types; exactly-once semantics strategy
+Redis Cluster/sentinel configs; Mongo replica sets, backup/restore, TTL/data retention
+Observability
+Structured logging (request IDs), distributed tracing (OpenTelemetry)
+Prometheus metrics expanded (latency histograms, queue depth); dashboards and alerts
+API/product
+Full OpenAPI spec (schemas/examples), versioned API, consistent pagination
+Admin endpoints (ban, invalidate sessions, revoke-all globally), API key management UI
+WebSocket for real-time leaderboard (SSE exists but limited)
+Data model/indexing
+Compound indexes review (e.g., rating hot paths), migration scripts, seed scripts
+Historical analytics store (cold storage) separate from live path
+Tests/CI/CD
+Unit/integration/e2e tests (auth, events, sharding, aggregator), load tests
+CI pipeline (lint/test/security scan), CD with blue/green or canary
+DevX/infra
+Dockerfiles and compose for all services (API, worker, aggregator, Redis, Mongo)
+Helm/Terraform for cloud deployments; readiness/liveness probes; health for shards
+Config/sharding
+Dynamic shard discovery/reload (not only from env); health-aware routing/failover
+Regional aggregator windows and consistency guarantees documented
+Frontend/UX (optional)
+Developer docs and quickstart; example clients for SSE/WebSocket; Postman collection

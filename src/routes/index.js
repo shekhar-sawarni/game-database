@@ -48,6 +48,8 @@ router.get('/auth/me', requireAuth, async (req, res) => {
 });
 
 router.post('/auth/profile', requireAuth, updateProfile);
+router.put('/auth/profile', requireAuth, updateProfile); // RESTful update alias
+router.post('/auth/update', requireAuth, updateProfile); // Alternate alias
 router.post('/auth/change-password', requireAuth, changePassword);
 router.post('/auth/revoke-all', requireAuth, revokeAllSessions);
 // SSE live leaderboard

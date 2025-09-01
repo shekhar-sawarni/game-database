@@ -8,7 +8,9 @@
     "start": "node src/index.js",
     "worker": "node src/workers/gameResultWorker.js",
     "aggregator": "node src/workers/aggregatorWorker.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "demo": "node scripts/demoGames.js",
+    "seed:users": "node scripts/seedUsers.js"
   },
   "keywords": [],
   "author": "",
